@@ -1,11 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-pragma solidity ^0.8.2;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
-contract LBPPool is Initializable {
+contract LBPPool is ReentrancyGuard, OwnableUpgradeable {
     using SafeERC20 for IERC20;
 
     struct PoolToken {
@@ -14,80 +15,92 @@ contract LBPPool is Initializable {
         uint256 denormWeight;
     }
 
-    uint256 private constant MIN_WEIGHT = 1e16; // 1%
-    uint256 private constant MAX_WEIGHT = 50e16; // 50%
-    uint256 private constant TOTAL_WEIGHT = 50e18; // 100%
+    uint256 private constant WEIGHT_MULTIPLIER = 1e16;
+    uint256 private constant MIN_WEIGHT = 1; // 1%
+    uint256 private constant MAX_WEIGHT = 99; // 99%
+    uint256 private constant TOTAL_WEIGHT = 100; // 100%
     uint256 private constant MIN_BALANCE = 1e6;
 
-    PoolToken[] public poolTokens;
+    PoolToken[2] public poolTokens;
     uint256 public swapFeePercentage;
     bool public swapEnabled;
-    address public owner;
 
-    // Weight change parameters
     uint256 public startTime;
     uint256 public endTime;
-    uint256[] public startWeights;
-    uint256[] public endWeights;
+    uint256[2] public startWeights;
+    uint256[2] public endWeights;
 
+    bool private initialized;
+
+    event WeightsSet(uint256 weight0, uint256 weight1);
     event SwapFeePercentageChanged(uint256 swapFeePercentage);
     event SwapEnabledSet(bool swapEnabled);
     event GradualWeightUpdateScheduled(
         uint256 startTime,
         uint256 endTime,
-        uint256[] startWeights,
-        uint256[] endWeights
+        uint256[2] startWeights,
+        uint256[2] endWeights
+    );
+    event Swap(
+        address indexed caller,
+        IERC20 indexed tokenIn,
+        IERC20 indexed tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
     );
 
     function initialize(
-        IERC20[] memory tokens,
-        uint256[] memory initialBalances,
-        uint256[] memory weights,
+        address owner,
+        IERC20[2] memory tokens,
+        uint256[2] memory initialBalances,
+        uint256[2] memory weights,
         uint256 _swapFeePercentage,
         bool _swapEnabledOnStart,
-        address _owner
-    ) public initializer {
+        uint256 _startTime,
+        uint256 _endTime
+    ) external initializer {
+        __Ownable_init(owner);
+
         require(
-            tokens.length == initialBalances.length &&
-                tokens.length == weights.length,
-            "Array lengths must match"
+            weights[0] >= MIN_WEIGHT && weights[0] <= MAX_WEIGHT,
+            "Weight 0 out of range"
         );
         require(
-            tokens.length >= 2 && tokens.length <= 4,
-            "Must have 2-4 tokens"
+            weights[1] >= MIN_WEIGHT && weights[1] <= MAX_WEIGHT,
+            "Weight 1 out of range"
+        );
+        require(
+            weights[0] + weights[1] == TOTAL_WEIGHT,
+            "Total weight must be 100%"
+        );
+        require(
+            initialBalances[0] >= MIN_BALANCE &&
+                initialBalances[1] >= MIN_BALANCE,
+            "Balance too low"
         );
 
-        uint256 totalWeight = 0;
-        for (uint256 i = 0; i < tokens.length; i++) {
-            require(
-                weights[i] >= MIN_WEIGHT && weights[i] <= MAX_WEIGHT,
-                "Weight out of range"
-            );
-            require(initialBalances[i] >= MIN_BALANCE, "Balance too low");
-            totalWeight += weights[i];
-
-            poolTokens.push(
-                PoolToken({
-                    token: tokens[i],
-                    balance: initialBalances[i],
-                    denormWeight: weights[i]
-                })
-            );
-            tokens[i].safeTransferFrom(
-                msg.sender,
-                address(this),
-                initialBalances[i]
-            );
+        for (uint256 i = 0; i < 2; i++) {
+            poolTokens[i] = PoolToken({
+                token: tokens[i],
+                balance: initialBalances[i],
+                denormWeight: weights[i] * WEIGHT_MULTIPLIER
+            });
         }
-        require(totalWeight == TOTAL_WEIGHT, "Total weight must be 100%");
 
         swapFeePercentage = _swapFeePercentage;
         swapEnabled = _swapEnabledOnStart;
-        owner = _owner;
+        startTime = _startTime;
+        endTime = _endTime;
+        startWeights = weights;
+        endWeights = weights;
+
+        initialized = true;
+        emit WeightsSet(weights[0], weights[1]);
     }
 
-    function setSwapFeePercentage(uint256 newSwapFeePercentage) external {
-        require(msg.sender == owner, "Only owner");
+    function setSwapFeePercentage(
+        uint256 newSwapFeePercentage
+    ) external onlyOwner {
         require(
             newSwapFeePercentage >= 1e12 && newSwapFeePercentage <= 1e17,
             "Invalid swap fee percentage"
@@ -96,8 +109,7 @@ contract LBPPool is Initializable {
         emit SwapFeePercentageChanged(newSwapFeePercentage);
     }
 
-    function setSwapEnabled(bool enabled) external {
-        require(msg.sender == owner, "Only owner");
+    function setSwapEnabled(bool enabled) external onlyOwner {
         swapEnabled = enabled;
         emit SwapEnabledSet(enabled);
     }
@@ -105,38 +117,30 @@ contract LBPPool is Initializable {
     function updateWeightsGradually(
         uint256 _startTime,
         uint256 _endTime,
-        uint256[] memory newEndWeights
-    ) external {
-        require(msg.sender == owner, "Only owner");
+        uint256[2] memory newEndWeights
+    ) external onlyOwner {
         require(
             _startTime >= block.timestamp,
             "Start time must be in the future"
         );
         require(_endTime > _startTime, "End time must be after start time");
         require(
-            newEndWeights.length == poolTokens.length,
-            "Weights array length mismatch"
+            newEndWeights[0] >= MIN_WEIGHT && newEndWeights[0] <= MAX_WEIGHT,
+            "Weight 0 out of range"
         );
-
-        uint256 totalWeight = 0;
-        for (uint256 i = 0; i < newEndWeights.length; i++) {
-            require(
-                newEndWeights[i] >= MIN_WEIGHT &&
-                    newEndWeights[i] <= MAX_WEIGHT,
-                "Weight out of range"
-            );
-            totalWeight += newEndWeights[i];
-        }
-        require(totalWeight == TOTAL_WEIGHT, "Total weight must be 100%");
+        require(
+            newEndWeights[1] >= MIN_WEIGHT && newEndWeights[1] <= MAX_WEIGHT,
+            "Weight 1 out of range"
+        );
+        require(
+            newEndWeights[0] + newEndWeights[1] == TOTAL_WEIGHT,
+            "Total weight must be 100%"
+        );
 
         startTime = _startTime;
         endTime = _endTime;
-        startWeights = new uint256[](poolTokens.length);
+        startWeights = getCurrentDenormWeights();
         endWeights = newEndWeights;
-
-        for (uint256 i = 0; i < poolTokens.length; i++) {
-            startWeights[i] = poolTokens[i].denormWeight;
-        }
 
         emit GradualWeightUpdateScheduled(
             startTime,
@@ -149,35 +153,34 @@ contract LBPPool is Initializable {
     function getNormalizedWeights()
         public
         view
-        returns (uint256[] memory weights)
+        returns (uint256[2] memory weights)
     {
-        weights = new uint256[](poolTokens.length);
-        uint256 totalWeight = 0;
+        uint256[2] memory denormWeights = getCurrentDenormWeights();
+        uint256 totalWeight = denormWeights[0] + denormWeights[1];
+        weights[0] = (denormWeights[0] * 1e18) / totalWeight;
+        weights[1] = (denormWeights[1] * 1e18) / totalWeight;
+    }
 
-        if (block.timestamp < startTime) {
-            for (uint256 i = 0; i < poolTokens.length; i++) {
-                weights[i] = poolTokens[i].denormWeight;
-                totalWeight += weights[i];
-            }
+    function getCurrentDenormWeights()
+        public
+        view
+        returns (uint256[2] memory weights)
+    {
+        if (block.timestamp <= startTime) {
+            return startWeights;
         } else if (block.timestamp >= endTime) {
-            for (uint256 i = 0; i < poolTokens.length; i++) {
-                weights[i] = endWeights[i];
-                totalWeight += weights[i];
-            }
+            return endWeights;
         } else {
             uint256 pctProgress = ((block.timestamp - startTime) * 1e18) /
                 (endTime - startTime);
-            for (uint256 i = 0; i < poolTokens.length; i++) {
-                weights[i] =
-                    startWeights[i] +
-                    ((endWeights[i] - startWeights[i]) * pctProgress) /
-                    1e18;
-                totalWeight += weights[i];
-            }
-        }
-
-        for (uint256 i = 0; i < weights.length; i++) {
-            weights[i] = (weights[i] * 1e18) / totalWeight;
+            weights[0] =
+                startWeights[0] +
+                ((endWeights[0] - startWeights[0]) * pctProgress) /
+                1e18;
+            weights[1] =
+                startWeights[1] +
+                ((endWeights[1] - startWeights[1]) * pctProgress) /
+                1e18;
         }
     }
 
@@ -185,7 +188,8 @@ contract LBPPool is Initializable {
         IERC20 tokenIn,
         IERC20 tokenOut,
         uint256 amountIn
-    ) external returns (uint256 amountOut) {
+    ) external nonReentrant returns (uint256 amountOut) {
+        require(initialized, "Pool not initialized");
         require(swapEnabled, "Swaps not enabled");
         require(tokenIn != tokenOut, "Cannot swap same token");
 
@@ -194,7 +198,7 @@ contract LBPPool is Initializable {
             tokenOut
         );
 
-        uint256[] memory weights = getNormalizedWeights();
+        uint256[2] memory weights = getNormalizedWeights();
         uint256 weightIn = weights[_getTokenIndex(tokenIn)];
         uint256 weightOut = weights[_getTokenIndex(tokenOut)];
 
@@ -230,42 +234,57 @@ contract LBPPool is Initializable {
         tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
         tokenOut.safeTransfer(msg.sender, amountOut);
 
-        return amountOut;
+        emit Swap(msg.sender, tokenIn, tokenOut, amountIn, amountOut);
+    }
+
+    function getPoolTokens()
+        external
+        view
+        returns (
+            IERC20[2] memory tokens,
+            uint256[2] memory balances,
+            uint256[2] memory weights
+        )
+    {
+        require(initialized, "Pool not initialized");
+        tokens[0] = poolTokens[0].token;
+        tokens[1] = poolTokens[1].token;
+        balances[0] = poolTokens[0].balance;
+        balances[1] = poolTokens[1].balance;
+        weights = getNormalizedWeights();
+    }
+
+    function getSwapFeePercentage() external view returns (uint256) {
+        return swapFeePercentage;
+    }
+
+    function getLatest(
+        IERC20 token
+    ) external view returns (uint256 balance, uint256 weight) {
+        require(initialized, "Pool not initialized");
+        uint256 index = _getTokenIndex(token);
+        balance = poolTokens[index].balance;
+        weight = getNormalizedWeights()[index];
     }
 
     function _getPoolTokens(
         IERC20 tokenA,
         IERC20 tokenB
     ) internal view returns (PoolToken storage, PoolToken storage) {
-        uint256 indexA = type(uint256).max;
-        uint256 indexB = type(uint256).max;
-
-        for (uint256 i = 0; i < poolTokens.length; i++) {
-            if (poolTokens[i].token == tokenA) {
-                indexA = i;
-            } else if (poolTokens[i].token == tokenB) {
-                indexB = i;
-            }
-
-            if (indexA != type(uint256).max && indexB != type(uint256).max) {
-                break;
-            }
-        }
-
         require(
-            indexA != type(uint256).max && indexB != type(uint256).max,
-            "Token not found in pool"
+            (tokenA == poolTokens[0].token && tokenB == poolTokens[1].token) ||
+                (tokenA == poolTokens[1].token &&
+                    tokenB == poolTokens[0].token),
+            "Invalid token pair"
         );
-        return (poolTokens[indexA], poolTokens[indexB]);
+        return
+            tokenA == poolTokens[0].token
+                ? (poolTokens[0], poolTokens[1])
+                : (poolTokens[1], poolTokens[0]);
     }
 
     function _getTokenIndex(IERC20 token) internal view returns (uint256) {
-        for (uint256 i = 0; i < poolTokens.length; i++) {
-            if (poolTokens[i].token == token) {
-                return i;
-            }
-        }
-        revert("Token not found in pool");
+        return token == poolTokens[0].token ? 0 : 1;
     }
 
     function _calculateSpotPrice(
@@ -288,7 +307,7 @@ contract LBPPool is Initializable {
         uint256 weightRatio = (weightIn * 1e18) / weightOut;
         uint256 adjustedIn = (amountIn * (1e18 - swapFee)) / 1e18;
         uint256 y = (balanceIn * 1e18) / (balanceIn + adjustedIn);
-        uint256 foo = y ** weightRatio;
+        uint256 foo = y ** (weightRatio / 1e18);
         uint256 bar = 1e18 - foo;
         amountOut = (balanceOut * bar) / 1e18;
     }
